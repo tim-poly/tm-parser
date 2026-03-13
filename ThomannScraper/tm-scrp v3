@@ -1,0 +1,381 @@
+import requests
+import csv
+import json
+import time
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+TARGET_BRANDS = {
+    "adam_audio": "ADAM Audio",
+    "audient": "Audient",
+    "dod": "DOD",
+    "dunlop": "Dunlop",
+    "hohner": "Hohner",
+    "laney": "Laney",
+    "mackie": "Mackie",
+    "mxr": "MXR",
+    "pulse": "PULSE",
+    "rode": "RODE",
+    "shadow": "SHADOW",
+    "way_huge": "WAYHUGE",
+    "digitech": "DIGITECH",
+    "casio": "CASIO",
+    "cort": "Cort"
+}
+
+BASE_URL = "https://www.thomann.se/search_dir.html?sw={}&pg={}&ls=5000"
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Mozilla/5.0 (X11; Linux x86_64)",
+]
+
+SESSION = requests.Session()
+SESSION.headers.update({
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Upgrade-Insecure-Requests": "1"
+})
+from requests.adapters import HTTPAdapter
+
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
+# Thread safety
+sku_lock = threading.Lock()
+
+class RequestScheduler:
+
+    def __init__(self):
+
+        self.rate = 0.8      # tokens added per second
+        self.capacity = 4    # max burst
+        self.tokens = 4
+
+        self.last_refill = time.time()
+        self.lock = threading.Lock()
+
+    def wait(self):
+
+        while True:
+
+            with self.lock:
+
+                now = time.time()
+                elapsed = now - self.last_refill
+
+                # refill tokens
+                new_tokens = elapsed * self.rate
+                self.tokens = min(self.capacity, self.tokens + new_tokens)
+
+                self.last_refill = now
+
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+
+            time.sleep(random.uniform(0.1, 0.3))
+
+    def success(self):
+        pass
+
+    def rate_limited(self):
+
+        with self.lock:
+
+            # slow down token generation
+            self.rate = max(0.5, self.rate * 0.7)
+
+            print(f"Rate limit detected → new request rate {round(self.rate,2)} req/sec")
+
+scheduler = RequestScheduler()
+
+global_cooldown_until = 0
+cooldown_lock = threading.Lock()
+
+def fetch_page(url, retries=4):
+
+    global global_cooldown_until
+
+    for attempt in range(retries):
+
+        # respect global cooldown
+        with cooldown_lock:
+            if time.time() < global_cooldown_until:
+                wait = global_cooldown_until - time.time()
+                print(f"Global cooldown {round(wait,1)}s")
+                time.sleep(wait)
+
+        scheduler.wait()
+
+        try:
+            response = SESSION.get(
+                url,
+                headers={
+                    "User-Agent": random.choice(USER_AGENTS),
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Referer": "https://www.thomann.se/"
+                },
+                timeout=15
+            )
+
+            if response.status_code == 404:
+                print(f"404 page: {url}")
+                return None
+
+            if response.status_code == 429:
+
+                print("429 Too Many Requests")
+
+                scheduler.rate_limited()
+
+                cooldown = random.uniform(25,40)
+
+                with cooldown_lock:
+                    global_cooldown_until = time.time() + cooldown
+
+                print(f"Cooling down for {round(cooldown,1)} seconds")
+
+                time.sleep(cooldown)
+
+                continue
+
+            if response.status_code >= 500:
+                print("Server error")
+                scheduler.rate_limited()
+                continue
+
+            response.raise_for_status()
+
+            scheduler.success()
+
+            return response.text
+
+        except requests.RequestException as e:
+
+            backoff = min(30, 2 ** attempt)
+            jitter = random.uniform(0.5, 1.5)
+            wait = backoff * jitter
+
+            print(f"Request failed: {e}")
+            print(f"Retry {attempt+1}/{retries} in {round(wait,1)} seconds")
+
+            time.sleep(float(wait))
+
+    return None
+
+
+"""def discover_brands():
+
+    url = "https://www.thomann.se/cat_brands.html"
+
+    print("Discovering brands...")
+
+    html = fetch_page(url)
+
+    if not html:
+        print("Failed to load brand directory.")
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    brands = set()
+
+    for link in soup.find_all("a"):
+
+        name = link.get_text(strip=True)
+
+        if not name:
+            continue
+
+        slug = name.lower()
+
+        slug = slug.replace("&", "and")
+        slug = slug.replace(" ", "_")
+        slug = slug.replace(".", "")
+        slug = slug.replace("-", "_")
+
+        if not re.match("^[a-z]", slug):
+            continue
+
+        brands.add(slug)
+
+    brands = sorted(brands)
+
+    print(f"Discovered {len(brands)} brands")
+
+    return brands"""
+
+
+def extract_items_json(html):
+
+    start = html.find('"items":')
+
+    if start == -1:
+        return None
+
+    start = html.find('[', start)
+
+    if start == -1:
+        return None
+
+    bracket_count = 0
+
+    for i in range(start, len(html)):
+
+        if html[i] == '[':
+            bracket_count += 1
+
+        elif html[i] == ']':
+            bracket_count -= 1
+
+            if bracket_count == 0:
+                return html[start:i+1]
+
+    return None
+
+
+def parse_products(html):
+
+    items_json = extract_items_json(html)
+
+    if not items_json:
+        print("Could not find items array")
+        return []
+
+    items = json.loads(items_json)
+
+    products = []
+
+    for item in items:
+
+        product = {
+            "sku": item.get("item_id"),
+            "name": item.get("item_name"),
+            "brand": TARGET_BRANDS.get(item.get("item_brand", "").lower(), item.get("item_brand")),
+            "price": item.get("price"),
+            "currency": item.get("currency"),
+            "category": item.get("item_category"),
+            "url": f"https://www.thomann.se/{item.get('item_id')}.htm"
+        }
+
+        products.append(product)
+
+    return products
+
+
+def scrape_all_pages(brand, global_skus):
+
+    page = 1
+    all_products = []
+
+    while True:
+
+        url = BASE_URL.format(brand, page)
+
+        html = fetch_page(url)
+
+        if html is None:
+            print(f"Stopping brand {brand}")
+            break
+
+        print(f"{brand.upper()} | page {page}")
+
+        products = parse_products(html)
+
+        if not products:
+            print(f"{brand} finished at page {page}")
+            break
+
+        # if fewer results than page size → last page
+        if len(products) < 5000:
+            all_products.extend(new_products)
+            print(f"{brand} completed")
+            break
+
+        new_products = []
+
+        for p in products:
+
+            sku = p.get("sku")
+
+            if not sku:
+                continue
+
+            with sku_lock:
+                if sku in global_skus:
+                    continue
+                global_skus.add(sku)
+
+            new_products.append(p)
+
+        print(f"{brand} page {page} → {len(new_products)} new products")
+
+        all_products.extend(new_products)
+
+        page += 1
+
+    return all_products
+
+def save_to_csv(products):
+
+    if not products:
+        print("No products to save")
+        return
+
+    keys = products[0].keys()
+
+    with open("thomann_list.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(products)
+
+    print(f"Saved {len(products)} products to thomann_list.csv")
+def print_summary(products):
+
+    print("\n--- SCRAPE SUMMARY ---")
+    print("Total products:", len(products))
+
+    prices = [float(p["price"]) for p in products if p["price"]]
+
+    if prices:
+        print("Min price:", min(prices))
+        print("Max price:", max(prices))
+        print("Average price:", round(sum(prices) / len(prices), 2))
+
+
+def main():
+
+    brands = list(TARGET_BRANDS.keys())
+
+    print(f"\nScraping {len(brands)} selected brands...\n")
+
+    all_products = []
+    global_skus = set()
+
+    with ThreadPoolExecutor(max_workers=min(2, len(brands))) as executor:
+
+        futures = []
+
+        for brand in brands:
+            future = executor.submit(scrape_all_pages, brand, global_skus)
+            futures.append(future)
+
+            # stagger thread start slightly
+            time.sleep(random.uniform(0.8, 1.6))
+
+        for future in as_completed(futures):
+            result = future.result()
+            all_products.extend(result)
+
+    print_summary(all_products)
+
+    save_to_csv(all_products)
+
+
+if __name__ == "__main__":
+    main()
