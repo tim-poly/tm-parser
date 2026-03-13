@@ -6,17 +6,34 @@ import time
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+from datetime import datetime
 import threading
+
+def log(message):
+    now = datetime.now().strftime("%H:%M:%S")
+    thread = threading.current_thread().name
+    print(f"[{now}] [{thread}] {message}")
+
+print_lock = threading.Lock()
+
+progress_lock = threading.Lock()
+csv_lock = threading.Lock()
+
+products_written = 0
+written_skus = set()
+
+def log(message):
+
+    with print_lock:
+        print(message)
 
 TARGET_BRANDS = [
 "ADAM Audio",
 "Audient",
 "Casio",
 "Cort",
-"DOD",
 "Dunlop",
 "Hohner",
-"Laney",
 "Mackie",
 "MXR",
 "RODE",
@@ -34,20 +51,25 @@ USER_AGENTS = [
 ]
 
 SESSION = requests.Session()
+from requests.adapters import HTTPAdapter
 
+adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20)
+
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
 # Thread safety
 sku_lock = threading.Lock()
 
 class RequestScheduler:
 
     def __init__(self):
-        self.base_delay = 3
+        self.base_delay = 1.2
         self.max_delay = 30
         self.current_delay = 3
 
     def wait(self):
         sleep_time = random.uniform(self.current_delay, self.current_delay + 2)
-        print(f"Scheduler sleeping {round(sleep_time,2)} seconds")
+        log(f"[WAIT] sleeping {round(sleep_time,2)}s")
         time.sleep(sleep_time)
 
     def success(self):
@@ -55,7 +77,7 @@ class RequestScheduler:
 
     def rate_limited(self):
         self.current_delay = min(self.max_delay, self.current_delay * 1.7)
-        print(f"Rate limit detected. Increasing delay to {round(self.current_delay,2)} seconds")
+        log(f"[RATE LIMIT] delay → {round(self.current_delay,2)}s")
 
 
 scheduler = RequestScheduler()
@@ -225,7 +247,7 @@ def scrape_all_pages(brand, global_skus):
     while True:
 
         url = BASE_URL.format(brand, page)
-        print(f"Scraping {brand} | page {page}")
+        log(f"[SCRAPE] Brand: {brand} | Page: {page}")
 
         html = fetch_page(url)
 
@@ -257,10 +279,10 @@ def scrape_all_pages(brand, global_skus):
 
             new_products.append(p)
 
-        print(f"{brand} page {page} -> {len(new_products)} new products")
+        log(f"{brand} page {page} -> {len(new_products)} new products")
 
         all_products.extend(new_products)
-
+        append_to_csv(new_products)
         page += 1
 
     return all_products
@@ -274,14 +296,54 @@ def save_to_csv(products):
 
     keys = products[0].keys()
 
-    with open("thomann_list.csv", "w", newline="", encoding="utf-8") as f:
+    with open("test_improved_list.csv", "w", newline="", encoding="utf-8") as f:
 
         writer = csv.DictWriter(f, fieldnames=keys)
         writer.writeheader()
         writer.writerows(products)
 
-    print(f"Saved {len(products)} products to thomann_list.csv")
+    print(f"Saved {len(products)} products to test_improved_list.csv")
 
+def append_to_csv(products):
+
+    global products_written
+
+    if not products:
+        return
+
+    keys = products[0].keys()
+
+    with csv_lock:
+
+        file_exists = False
+
+        try:
+            with open("thomann_list.csv"):
+                file_exists = True
+        except:
+            pass
+
+        with open("thomann_list.csv", "a", newline="", encoding="utf-8") as f:
+
+            writer = csv.DictWriter(f, fieldnames=keys)
+
+            if not file_exists:
+                writer.writeheader()
+
+            for product in products:
+
+                sku = product["sku"]
+
+                if sku in written_skus:
+                    continue
+
+                written_skus.add(sku)
+
+                writer.writerow(product)
+
+                with progress_lock:
+                    products_written += 1
+                    print(f"[PROGRESS] {products_written} products saved")
 
 def print_summary(products):
 
@@ -302,10 +364,8 @@ def main():
         "audient",
         "casio",
         "cort",
-        "dod",
         "dunlop",
         "hohner",
-        "laney",
         "mackie",
         "mxr",
         "rode",
@@ -323,7 +383,7 @@ def main():
 
     print("\nStarting parallel scraping...\n")
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
 
         futures = [
             executor.submit(scrape_all_pages, brand, global_skus)
